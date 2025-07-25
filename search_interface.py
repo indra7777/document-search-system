@@ -3,6 +3,7 @@ import logging
 import os
 import json
 import webbrowser
+import hashlib
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 import time
@@ -19,58 +20,89 @@ from document_analyzer import DocumentAnalyzer
 from service_manager import service_manager
 from gpu_optimizer import gpu_optimizer
 from document_tracker import document_tracker
+from fast_startup import FastStartupConfig, log_fast_startup_status
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+@st.cache_resource(show_spinner="⚡ Fast startup - Loading essential services...", hash_funcs={Config: lambda x: "config"})
+def _initialize_services():
+    """Initialize and cache services with fast startup optimization"""
+    # Log startup mode
+    log_fast_startup_status()
+    
+    config = Config()
+    config.create_directories()
+    
+    # Always enable GPU optimizations (lightweight)
+    gpu_optimizer.enable_memory_efficient_attention()
+    gpu_optimizer.setup_mixed_precision()
+    
+    # Set config for service manager
+    service_manager.set_config(config)
+    
+    # Initialize only essential services for fast startup
+    services = {
+        'config': config,
+        'doc_processor': service_manager.get_service('document_processor', DocumentProcessor, config),
+        'embedding_service': service_manager.get_service('embedding_service', EmbeddingService, config),
+        'vector_db': service_manager.get_service('vector_database', VectorDatabase, config),
+    }
+    
+    # Always lazy load heavy services for fast startup
+    services['doc_analyzer'] = None  # 📊 TrOCR model - loads on document upload
+    services['llm_service'] = None   # 🤖 LLM model - loads on first AI response, then cached
+    
+    # Load vector database index (lightweight)
+    services['vector_db'].load_index(config.EMBEDDING_DIMENSION)
+    
+    # Fast startup complete
+    startup_msg = FastStartupConfig.get_startup_message()
+    logging.info(f"✅ {startup_msg}")
+    
+    return services
+
 class DocumentSearchInterface:
     def __init__(self):
-        self.config = Config()
-        self.config.create_directories()
-        
-        # Initialize services
-        self._init_services()
+        # Get cached services to prevent reloading
+        self.services = _initialize_services()
+        self.config = self.services['config']
+        self.doc_processor = self.services['doc_processor']
+        self.embedding_service = self.services['embedding_service']
+        self.vector_db = self.services['vector_db']
+        self._doc_analyzer = None  # Lazy loading
+        self._llm_service = None   # Lazy loading
         
         # Initialize session state
         if 'vector_db_loaded' not in st.session_state:
-            st.session_state.vector_db_loaded = False
+            st.session_state.vector_db_loaded = True  # Already loaded via cache
         if 'documents_processed' not in st.session_state:
             st.session_state.documents_processed = 0
     
+    @property
+    def doc_analyzer(self):
+        """Lazy load document analyzer only when needed (heavy TrOCR model)"""
+        if self._doc_analyzer is None:
+            with st.spinner("📊 Loading document analyzer (TrOCR, table extraction)..."):
+                self._doc_analyzer = service_manager.get_service('document_analyzer', DocumentAnalyzer, self.config)
+        return self._doc_analyzer
+    
+    @property
+    def llm_service(self):
+        """Lazy load LLM service with GPU optimization"""
+        if self._llm_service is None:
+            self._llm_service = self._get_cached_llm_service()
+        return self._llm_service
+    
+    @st.cache_resource(show_spinner="🚀 Loading LLM to GPU (one-time setup)...")
+    def _get_cached_llm_service(_self):
+        """Cache LLM service globally to prevent reloading"""
+        return service_manager.get_service('llm_service', LLMService, _self.config)
+    
     def _init_services(self):
-        """Initialize all services using singleton pattern to prevent memory leaks"""
-        try:
-            # Set config for service manager
-            service_manager.set_config(self.config)
-            
-            # Get services using singleton pattern - prevents multiple instances
-            self.doc_processor = service_manager.get_service(
-                'document_processor', DocumentProcessor, self.config
-            )
-            self.embedding_service = service_manager.get_service(
-                'embedding_service', EmbeddingService, self.config
-            )
-            self.vector_db = service_manager.get_service(
-                'vector_database', VectorDatabase, self.config
-            )
-            self.llm_service = service_manager.get_service(
-                'llm_service', LLMService, self.config
-            )
-            self.doc_analyzer = service_manager.get_service(
-                'document_analyzer', DocumentAnalyzer, self.config
-            )
-            
-            # Try to load existing vector database
-            self.vector_db.load_index(self.config.EMBEDDING_DIMENSION)
-            
-            # Log memory status
-            memory_stats = service_manager.get_memory_stats()
-            logger.info(f"Services initialized. Memory stats: {memory_stats}")
-            
-        except Exception as e:
-            st.error(f"Error initializing services: {str(e)}")
-            logger.error(f"Service initialization error: {str(e)}")
+        """Legacy method - services now loaded via cache"""
+        pass  # Services are now loaded via @st.cache_resource
     
     def run(self):
         """Main application interface"""
@@ -123,9 +155,17 @@ class DocumentSearchInterface:
         analyze_tables = st.sidebar.checkbox("Extract tables", value=True)
         analyze_images = st.sidebar.checkbox("Analyze images/handwriting", value=True)
         persist_files = st.sidebar.checkbox("Save files permanently", value=True)
+        force_reprocess = st.sidebar.checkbox("🔄 Force reprocess duplicates", value=False, 
+                                            help="Reprocess files even if they were already analyzed")
         
-        if uploaded_files and st.sidebar.button("🔍 Analyze & Process Files"):
-            self._process_uploaded_files_enhanced(uploaded_files, analyze_tables, analyze_images, persist_files)
+        # Process and remove buttons
+        col1, col2 = st.sidebar.columns(2)
+        with col1:
+            if uploaded_files and st.button("🔍 Analyze & Process"):
+                self._process_uploaded_files_enhanced(uploaded_files, analyze_tables, analyze_images, persist_files, force_reprocess)
+        with col2:
+            if st.button("🗑️ Remove Uploaded"):
+                self._remove_uploaded_files()
         
         # Show processed files
         if st.sidebar.button("📋 View Processed Files"):
@@ -170,48 +210,91 @@ class DocumentSearchInterface:
         with col2:
             similarity_threshold = st.slider("Similarity threshold", 0.0, 1.0, 0.7, 0.05)
         with col3:
-            enable_llm = st.checkbox("Generate AI response", value=True)
+            enable_llm = st.checkbox("Generate AI response", value=False, 
+                                   help="🤖 Slower but provides AI summary")
         with col4:
             prioritize_visuals = st.checkbox("Prioritize charts/images", value=False, 
-                                           help="Show results with charts and images first")
+                                           help="📊 Show results with charts and images first")
+        
+        # Show helpful tip when AI is enabled
+        if enable_llm:
+            st.info("💡 **Tip:** AI responses use GPU-accelerated LLM for faster generation")
         
         # Search button and results
         if st.button("Search", type="primary") and query:
             self._perform_search(query, top_k, similarity_threshold, enable_llm, prioritize_visuals)
     
     def _perform_search(self, query: str, top_k: int, threshold: float, enable_llm: bool, prioritize_visuals: bool = False):
-        """Perform document search and display results"""
+        """Perform optimized document search with minimal I/O"""
         try:
-            with st.spinner("Searching documents..."):
-                # Generate query embedding
+            # Step 1: Fast embedding generation (with caching)
+            with st.spinner("🔍 Generating query embedding..."):
+                start_time = time.time()
                 query_embedding = self.embedding_service.embed_query(query)
+                embedding_time = time.time() - start_time
                 
-                # Search vector database
+            # Step 2: Fast vector search (GPU-accelerated FAISS)
+            with st.spinner("⚡ Searching vector database..."):
+                search_start = time.time()
                 search_results = self.vector_db.search(
                     query_embedding, 
                     top_k=top_k, 
                     threshold=threshold
                 )
+                search_time = time.time() - search_start
                 
                 if not search_results:
                     st.warning("No relevant documents found. Try adjusting the similarity threshold.")
                     return
                 
-                # Display results count
-                st.success(f"Found {len(search_results)} relevant documents")
+            # Step 3: Show results immediately with performance stats
+            total_search_time = embedding_time + search_time
+            
+            # Performance feedback for user
+            if total_search_time < 0.5:
+                st.success(f"⚡ Found {len(search_results)} documents in {total_search_time:.3f}s (Lightning fast!)")
+            elif total_search_time < 2.0:
+                st.success(f"🚀 Found {len(search_results)} documents in {total_search_time:.2f}s (Fast)")
+            else:
+                st.success(f"✅ Found {len(search_results)} documents in {total_search_time:.2f}s")
+            
+            # Detailed timing in expander
+            with st.expander("⏱️ Performance Details"):
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    st.metric("Query Embedding", f"{embedding_time:.3f}s")
+                with col2:
+                    st.metric("Vector Search", f"{search_time:.3f}s")
+                with col3:
+                    cache_status = "🎯 Cache Hit" if embedding_time < 0.01 else "💫 GPU Computed"
+                    st.metric("Cache Status", cache_status)
+            
+            # Step 4: Generate LLM response first (if enabled) - users want AI answer first
+            if enable_llm:
+                # Show helpful loading message based on whether LLM is cached
+                if self._llm_service is None:
+                    loading_msg = "🚀 Loading LLM to GPU (first time) + generating response..."
+                else:
+                    loading_msg = "🤖 Generating AI response..."
                 
-                # Generate LLM response if enabled
-                if enable_llm:
-                    with st.spinner("Generating AI response..."):
-                        llm_response = self.llm_service.generate_response(query, search_results)
-                        self._display_llm_response(llm_response)
-                
-                # Sort results to prioritize visual content if requested
-                if prioritize_visuals:
-                    search_results = self._sort_results_by_visual_content(search_results)
-                
-                # Display search results
-                self._display_search_results(search_results)
+                with st.spinner(loading_msg):
+                    llm_start = time.time()
+                    llm_response = self.llm_service.generate_response(query, search_results)
+                    llm_time = time.time() - llm_start
+                    
+                    # Add timing info to response
+                    llm_response['generation_time'] = llm_time
+                    
+                    # Display AI response at the top
+                    self._display_llm_response(llm_response)
+            
+            # Step 5: Visual content sorting (optimized - no file I/O during search)
+            if prioritize_visuals:
+                with st.spinner("📊 Prioritizing visual content..."):
+                    search_results = self._sort_results_by_visual_content_fast(search_results)
+            
+            # Step 6: Display source documents after AI response
+            self._display_search_results(search_results)
                 
         except Exception as e:
             st.error(f"Search error: {str(e)}")
@@ -224,13 +307,26 @@ class DocumentSearchInterface:
         with st.container():
             st.markdown(response['answer'])
             
-            # Display response metadata
-            with st.expander("Response Details"):
-                col1, col2 = st.columns(2)
+            # Display response metadata with performance info
+            with st.expander("🔍 Response Details"):
+                col1, col2, col3 = st.columns(3)
                 with col1:
                     st.metric("Model Used", response['model'])
                     st.metric("Context Documents", response['context_used'])
                 with col2:
+                    if 'generation_time' in response:
+                        gen_time = response['generation_time']
+                        if gen_time < 2:
+                            st.metric("Generation Time", f"{gen_time:.2f}s ⚡")
+                        elif gen_time < 5:
+                            st.metric("Generation Time", f"{gen_time:.2f}s 🚀")
+                        else:
+                            st.metric("Generation Time", f"{gen_time:.2f}s")
+                    
+                    if 'tokens_generated' in response:
+                        st.metric("Tokens Generated", response['tokens_generated'])
+                
+                with col3:
                     st.write("**Sources Used:**")
                     for i, source in enumerate(response['sources'], 1):
                         st.write(f"{i}. {source['file_name']} (similarity: {source['similarity_score']:.3f})")
@@ -397,15 +493,25 @@ class DocumentSearchInterface:
         except Exception as e:
             st.error(f"Cannot access file: {str(e)}", icon="⚠️")
     
-    def _process_uploaded_files_enhanced(self, uploaded_files, analyze_tables=True, analyze_images=True, persist_files=True):
-        """Enhanced processing of uploaded files with advanced analysis"""
+    def _process_uploaded_files_enhanced(self, uploaded_files, analyze_tables=True, analyze_images=True, persist_files=True, force_reprocess=False):
+        """Enhanced processing with automatic duplicate detection and removal"""
         try:
+            # Step 1: Detect and remove duplicates automatically
+            unique_files = self._detect_and_remove_duplicates(uploaded_files)
+            
+            if len(unique_files) < len(uploaded_files):
+                st.info(f"🔄 Removed {len(uploaded_files) - len(unique_files)} duplicate files automatically")
+            
+            if not unique_files:
+                st.warning("⚠️ All uploaded files were duplicates. No new files to process.")
+                return
+            
             analysis_results = []
             
-            with st.spinner("🔍 Analyzing uploaded files (tables, images, handwriting)..."):
+            with st.spinner("🔍 Analyzing unique files (tables, images, handwriting)..."):
                 progress_bar = st.progress(0)
                 
-                for i, uploaded_file in enumerate(uploaded_files):
+                for i, uploaded_file in enumerate(unique_files):
                     # Save file permanently if requested
                     if persist_files:
                         file_path = self.doc_analyzer.save_uploaded_file(uploaded_file)
@@ -418,28 +524,86 @@ class DocumentSearchInterface:
                     
                     # Perform comprehensive analysis
                     analysis_result = self.doc_analyzer.analyze_document(file_path)
+                    
+                    # Check if this is a duplicate from previous sessions
+                    if 'duplicate_of' in analysis_result and not force_reprocess:
+                        st.info(f"⏭️ Skipping {uploaded_file.name} - already processed as {analysis_result['duplicate_of']}")
+                        continue
+                        
                     analysis_results.append(analysis_result)
                     
                     # Update progress
-                    progress_bar.progress((i + 1) / len(uploaded_files))
+                    progress_bar.progress((i + 1) / len(unique_files))
                 
-                # Display analysis results with tracking info
-                self._display_analysis_results(analysis_results)
+                # Display analysis results
+                if analysis_results:
+                    self._display_analysis_results(analysis_results)
                 
-                # Process documents for vector database (existing functionality)
-                file_paths = [result.get("file_path") for result in analysis_results if "file_path" in result]
-                if file_paths:
-                    # Monitor memory before processing
-                    gpu_optimizer.monitor_memory_usage()
-                    self._process_documents(file_paths)
-                    # Cleanup after processing
-                    gpu_optimizer.cleanup_gpu_memory()
+                # Step 2: Ensure all files are preprocessed and loaded into vector database
+                self._ensure_vector_database_processing(analysis_results)
                 
-            st.success(f"✅ Successfully analyzed and processed {len(uploaded_files)} files!")
+            st.success(f"✅ Successfully processed {len(analysis_results)} new files into vector database!")
             
         except Exception as e:
             st.error(f"❌ Error processing files: {str(e)}")
             logger.error(f"Enhanced file processing error: {str(e)}")
+    
+    def _detect_and_remove_duplicates(self, uploaded_files):
+        """Detect and automatically remove duplicate files from upload batch"""
+        unique_files = []
+        seen_hashes = set()
+        
+        for uploaded_file in uploaded_files:
+            # Calculate file hash
+            uploaded_file.seek(0)  # Reset file pointer
+            file_content = uploaded_file.read()
+            file_hash = hashlib.md5(file_content).hexdigest()
+            uploaded_file.seek(0)  # Reset again
+            
+            if file_hash not in seen_hashes:
+                seen_hashes.add(file_hash)
+                unique_files.append(uploaded_file)
+            else:
+                logger.info(f"Detected duplicate file: {uploaded_file.name}")
+        
+        return unique_files
+    
+    def _ensure_vector_database_processing(self, analysis_results):
+        """Ensure all analyzed files are properly processed into vector database"""
+        if not analysis_results:
+            return
+            
+        # Extract file paths that need vector processing
+        file_paths = []
+        for result in analysis_results:
+            if "file_path" in result and 'duplicate_of' not in result:
+                file_paths.append(result["file_path"])
+        
+        if file_paths:
+            with st.spinner("🚀 Loading documents into GPU-accelerated vector database..."):
+                # Monitor GPU memory before processing
+                gpu_optimizer.monitor_memory_usage()
+                
+                # Process documents into vector database
+                self._process_documents(file_paths)
+                
+                # Ensure FAISS index is loaded on GPU
+                self._ensure_gpu_vector_index()
+                
+                # Cleanup after processing
+                gpu_optimizer.cleanup_gpu_memory()
+                
+                st.success(f"🎯 Loaded {len(file_paths)} documents into GPU vector database")
+    
+    def _ensure_gpu_vector_index(self):
+        """Ensure FAISS vector index is properly loaded on GPU"""
+        try:
+            if self.vector_db.index is not None and hasattr(self.vector_db, '_gpu_enabled'):
+                if not self.vector_db._gpu_enabled:
+                    self.vector_db.move_to_gpu()
+                    st.info("📍 Vector index moved to GPU for faster search")
+        except Exception as e:
+            logger.warning(f"Could not ensure GPU vector index: {e}")
     
     def _process_uploaded_files(self, uploaded_files):
         """Legacy method - calls enhanced version"""
@@ -462,6 +626,11 @@ class DocumentSearchInterface:
     
     def _process_documents(self, paths: List[str]):
         """Process documents and add to vector database"""
+        # Ensure vector database is properly initialized
+        if self.vector_db is None:
+            st.error("Vector database not initialized")
+            return
+            
         # Process documents
         processed_docs = self.doc_processor.process_documents(paths)
         
@@ -475,18 +644,29 @@ class DocumentSearchInterface:
             chunks = self.doc_processor.chunk_document(doc)
             all_chunks.extend(chunks)
         
+        if not all_chunks:
+            st.warning("No document chunks created")
+            return
+        
         # Generate embeddings
         embedded_chunks = self.embedding_service.embed_documents(all_chunks)
         
+        if not embedded_chunks:
+            st.error("Failed to generate embeddings")
+            return
+        
         # Add to vector database
-        self.vector_db.add_documents(embedded_chunks)
-        
-        # Save database
-        self.vector_db.save_index()
-        
-        # Update session state
-        st.session_state.documents_processed += len(processed_docs)
-        st.session_state.vector_db_loaded = True
+        try:
+            self.vector_db.add_documents(embedded_chunks)
+            # Save database
+            self.vector_db.save_index()
+            # Update session state
+            st.session_state.documents_processed += len(processed_docs)
+            st.session_state.vector_db_loaded = True
+            st.success(f"✅ Added {len(embedded_chunks)} chunks to vector database")
+        except Exception as e:
+            st.error(f"❌ Failed to add documents to vector database: {str(e)}")
+            logger.error(f"Vector database error: {str(e)}")
     
     def _clear_database(self):
         """Clear the vector database"""
@@ -549,7 +729,12 @@ class DocumentSearchInterface:
                 is_duplicate = 'duplicate_of' in result
                 
                 if is_duplicate:
-                    st.warning(f"🔁 **Duplicate Document Detected!** This file is identical to: {result['duplicate_of']}")
+                    if result.get('force_reprocess_requested'):
+                        st.info(f"🔄 **Force Reprocess Requested** but file is identical to: {result['duplicate_of']}")
+                        st.warning("⚠️ Document content is identical - no new analysis needed.")
+                    else:
+                        st.warning(f"🔁 **Duplicate Document Detected!** This file is identical to: {result['duplicate_of']}")
+                        st.info("💡 **Tip:** Use 🔄 'Force reprocess duplicates' checkbox or 🗑️ Remove Uploaded button to clear old files.")
                 elif tracking_info and not result.get('is_new_document', True):
                     st.info(f"📄 **Document Previously Processed** on {tracking_info.get('processing_timestamp', 'N/A')[:19]}")
                 else:
@@ -758,6 +943,54 @@ class DocumentSearchInterface:
             
         except Exception as e:
             st.error(f"Error during cleanup: {e}")
+    
+    def _remove_uploaded_files(self):
+        """Remove uploaded files from data directory and processed files"""
+        try:
+            with st.spinner("🗑️ Removing uploaded files..."):
+                removed_count = 0
+                
+                # Remove files from uploads directory
+                uploads_dir = self.config.DATA_DIR / "uploads"
+                if uploads_dir.exists():
+                    for file in uploads_dir.iterdir():
+                        if file.is_file():
+                            try:
+                                file.unlink()
+                                removed_count += 1
+                            except Exception as e:
+                                logger.warning(f"Could not remove {file}: {e}")
+                
+                # Remove files from data directory (temporary uploads)
+                for file in self.config.DATA_DIR.iterdir():
+                    if file.is_file() and file.suffix.lower() in ['.pdf', '.docx', '.txt', '.md', '.png', '.jpg', '.jpeg']:
+                        try:
+                            file.unlink()
+                            removed_count += 1
+                        except Exception as e:
+                            logger.warning(f"Could not remove {file}: {e}")
+                
+                # Clean up processed files directory
+                processed_dir = Path(self.config.BASE_DIR) / "processed_files"
+                if processed_dir.exists():
+                    for file in processed_dir.iterdir():
+                        if file.is_file():
+                            try:
+                                file.unlink()
+                                removed_count += 1
+                            except Exception as e:
+                                logger.warning(f"Could not remove processed file {file}: {e}")
+                
+                # Clear session state
+                if 'uploaded_files' in st.session_state:
+                    del st.session_state['uploaded_files']
+                
+                st.success(f"✅ Successfully removed {removed_count} files!")
+                st.rerun()  # Refresh the page to update file list
+                
+        except Exception as e:
+            st.error(f"❌ Error removing files: {str(e)}")
+            logger.error(f"File removal error: {str(e)}")
     
     def _display_visual_sources(self, analysis_data: Dict[str, Any], search_content: str):
         """Display relevant charts and images as sources for the search result"""
@@ -970,6 +1203,30 @@ class DocumentSearchInterface:
         except Exception as e:
             st.error(f"Error displaying inline visuals: {e}")
             logger.error(f"Error displaying inline visuals: {e}")
+    
+    def _sort_results_by_visual_content_fast(self, results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Fast visual content sorting without file I/O during search"""
+        try:
+            # Use content keywords to estimate visual richness (no file reading)
+            for result in results:
+                content = result.get('content', '').lower()
+                visual_keywords = ['chart', 'graph', 'table', 'figure', 'diagram', 'data', 'trend']
+                
+                # Simple keyword-based scoring (fast)
+                visual_score = sum(1 for keyword in visual_keywords if keyword in content)
+                result['visual_score'] = visual_score
+            
+            # Sort by visual score, then similarity
+            sorted_results = sorted(results, key=lambda x: (x.get('visual_score', 0), x['similarity_score']), reverse=True)
+            
+            visual_count = sum(1 for r in sorted_results if r.get('visual_score', 0) > 0)
+            logger.info(f"Fast visual sorting: {visual_count} results with visual keywords")
+            
+            return sorted_results
+            
+        except Exception as e:
+            logger.error(f"Error in fast visual sorting: {e}")
+            return results  # Return original results if sorting fails
     
     def _sort_results_by_visual_content(self, results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Sort search results to prioritize those with visual content (charts, images, tables)"""

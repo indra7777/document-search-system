@@ -6,6 +6,7 @@ from typing import List, Dict, Any, Tuple
 import logging
 from pathlib import Path
 import pickle
+import torch
 
 class VectorDatabase:
     def __init__(self, config):
@@ -15,31 +16,46 @@ class VectorDatabase:
         self.logger = logging.getLogger(__name__)
         self.db_path = config.VECTOR_DB_PATH / "faiss_index"
         self.metadata_path = config.VECTOR_DB_PATH / "metadata.pkl"
+        self._gpu_enabled = False
+        self._gpu_resources = None
         
         # Create vector DB directory
         config.VECTOR_DB_PATH.mkdir(parents=True, exist_ok=True)
+        
+        # Initialize GPU resources if available
+        self._init_gpu_resources()
+    
+    def _init_gpu_resources(self):
+        """Initialize GPU resources for FAISS"""
+        try:
+            if torch.cuda.is_available() and faiss.get_num_gpus() > 0:
+                self._gpu_resources = faiss.StandardGpuResources()
+                # Set memory fraction for FAISS (leave room for other GPU operations)
+                self._gpu_resources.setDefaultNullStreamAllDevices()
+                self.logger.info(f"Initialized FAISS GPU resources on {torch.cuda.get_device_name(0)}")
+                return True
+        except Exception as e:
+            self.logger.warning(f"Could not initialize FAISS GPU resources: {e}")
+        return False
     
     def create_index(self, embedding_dimension: int, num_docs: int = 0):
-        """Create a new FAISS index optimized for dataset size"""
+        """Create a new GPU-optimized FAISS index"""
         try:
             # For small datasets (< 1000 docs), use simple flat index
             # For larger datasets, use IVF index with appropriate cluster count
             if num_docs < 1000:
-                self.logger.info("Using Flat index for small dataset")
+                self.logger.info("Creating Flat index for small dataset")
                 self.index = faiss.IndexFlatIP(embedding_dimension)  # Inner product for cosine similarity
             else:
                 # Use IVF (Inverted File) index for better performance on large datasets
                 # Number of clusters should be roughly sqrt(num_documents), but at least 4*sqrt(num_docs)
                 nlist = min(1024, max(16, int(4 * (num_docs ** 0.5))))
-                self.logger.info(f"Using IVF index with {nlist} clusters")
+                self.logger.info(f"Creating IVF index with {nlist} clusters")
                 quantizer = faiss.IndexFlatIP(embedding_dimension)
                 self.index = faiss.IndexIVFFlat(quantizer, embedding_dimension, nlist)
             
-            # Enable GPU acceleration if available
-            if faiss.get_num_gpus() > 0:
-                self.logger.info("Enabling GPU acceleration for FAISS")
-                gpu_resources = faiss.StandardGpuResources()
-                self.index = faiss.index_cpu_to_gpu(gpu_resources, 0, self.index)
+            # Automatically move to GPU if available
+            self.move_to_gpu()
             
             self.logger.info(f"Created FAISS index with dimension {embedding_dimension}")
             
@@ -47,6 +63,31 @@ class VectorDatabase:
             self.logger.error(f"Failed to create FAISS index: {str(e)}")
             # Fallback to simple flat index
             self.index = faiss.IndexFlatIP(embedding_dimension)
+    
+    def move_to_gpu(self):
+        """Move FAISS index to GPU for faster operations"""
+        try:
+            if self.index is not None and self._gpu_resources is not None and not self._gpu_enabled:
+                # Move index to GPU
+                self.index = faiss.index_cpu_to_gpu(self._gpu_resources, 0, self.index)
+                self._gpu_enabled = True
+                self.logger.info("🚀 FAISS index moved to GPU for accelerated search")
+                return True
+        except Exception as e:
+            self.logger.warning(f"Could not move FAISS index to GPU: {e}")
+        return False
+    
+    def move_to_cpu(self):
+        """Move FAISS index back to CPU"""
+        try:
+            if self.index is not None and self._gpu_enabled:
+                self.index = faiss.index_gpu_to_cpu(self.index)
+                self._gpu_enabled = False
+                self.logger.info("FAISS index moved back to CPU")
+                return True
+        except Exception as e:
+            self.logger.warning(f"Could not move FAISS index to CPU: {e}")
+        return False
     
     def add_documents(self, documents: List[Dict[str, Any]]):
         """Add documents with embeddings to the vector database"""
@@ -115,10 +156,11 @@ class VectorDatabase:
         try:
             # Save FAISS index
             if self.index is not None:
-                # Convert GPU index to CPU before saving
-                if hasattr(self.index, 'index'):  # GPU index
+                # Convert GPU index to CPU before saving if needed
+                if self._gpu_enabled:
                     cpu_index = faiss.index_gpu_to_cpu(self.index)
                     faiss.write_index(cpu_index, str(self.db_path))
+                    self.logger.info("Converted GPU index to CPU for saving")
                 else:
                     faiss.write_index(self.index, str(self.db_path))
             
@@ -132,17 +174,16 @@ class VectorDatabase:
             self.logger.error(f"Failed to save vector database: {str(e)}")
     
     def load_index(self, embedding_dimension: int):
-        """Load the FAISS index and metadata from disk"""
+        """Load the FAISS index and metadata from disk with automatic GPU loading"""
         try:
             if self.db_path.exists():
-                # Load FAISS index
+                # Load FAISS index from disk
                 self.index = faiss.read_index(str(self.db_path))
                 
-                # Enable GPU acceleration if available
-                if faiss.get_num_gpus() > 0:
-                    self.logger.info("Enabling GPU acceleration for loaded index")
-                    gpu_resources = faiss.StandardGpuResources()
-                    self.index = faiss.index_cpu_to_gpu(gpu_resources, 0, self.index)
+                # Automatically move to GPU for accelerated operations
+                gpu_success = self.move_to_gpu()
+                if gpu_success:
+                    self.logger.info("🚀 Vector index automatically loaded to GPU")
                 
                 # Load document metadata
                 if self.metadata_path.exists():
@@ -152,21 +193,36 @@ class VectorDatabase:
                 self.logger.info(f"Vector database loaded with {self.index.ntotal} documents")
                 return True
             else:
-                self.logger.info("No existing vector database found, will create new one")
+                self.logger.info("No existing vector database found, creating new GPU-optimized index")
+                self.create_index(embedding_dimension, num_docs=0)
                 return False
                 
         except Exception as e:
             self.logger.error(f"Failed to load vector database: {str(e)}")
+            # Create new index if loading fails
+            self.create_index(embedding_dimension, num_docs=0)
             return False
     
     def get_stats(self) -> Dict[str, Any]:
-        """Get statistics about the vector database"""
-        return {
+        """Get comprehensive statistics about the vector database"""
+        stats = {
             'total_documents': len(self.documents),
             'index_size': self.index.ntotal if self.index else 0,
             'is_trained': self.index.is_trained if hasattr(self.index, 'is_trained') else True,
-            'database_path': str(self.config.VECTOR_DB_PATH)
+            'database_path': str(self.config.VECTOR_DB_PATH),
+            'gpu_enabled': self._gpu_enabled,
+            'gpu_available': torch.cuda.is_available() and faiss.get_num_gpus() > 0
         }
+        
+        # Add GPU memory info if available
+        if self._gpu_enabled and torch.cuda.is_available():
+            try:
+                gpu_memory = torch.cuda.memory_allocated() / 1024**3  # GB
+                stats['gpu_memory_allocated'] = f"{gpu_memory:.2f}GB"
+            except:
+                pass
+                
+        return stats
     
     def delete_index(self):
         """Delete the vector database files"""

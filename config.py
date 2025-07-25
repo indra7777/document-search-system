@@ -17,19 +17,27 @@ class Config:
     EMBEDDING_MODEL = "BAAI/bge-large-en-v1.5"  # High-accuracy BGE model
     EMBEDDING_DIMENSION = 1024
     
-    # GPU optimization settings
+    # GPU optimization settings for RTX 4090
     CUDA_BATCH_SIZE = 128  # Large batch size for RTX 4090
     USE_MIXED_PRECISION = True
+    GPU_MEMORY_FRACTION = 0.9  # Use 90% of GPU memory
+    ENABLE_GPU_OPTIMIZATIONS = True
     
     # Vector database
     VECTOR_DB_PATH = BASE_DIR / "vector_db"
     
-    # Local LLM configuration - llama.cpp
+    # Local LLM configuration - optimized for RTX 4090
     LOCAL_LLM_MODEL_PATH = BASE_DIR / "models" / "llama-model.gguf"  # Path to GGUF model
     LLM_TEMPERATURE = 0.1
     MAX_TOKENS = 2048
-    N_CTX = 4096  # Context window
+    N_CTX = 8192  # Larger context window for RTX 4090
     N_GPU_LAYERS = -1  # Use all GPU layers with RTX 4090
+    
+    # Advanced GPU settings
+    TENSOR_SPLIT = None  # Auto-distribute across GPU
+    ROPE_SCALING_TYPE = 0  # Default rope scaling
+    MUL_MAT_Q = True  # Enable quantized matrix multiplication
+    SPLIT_MODE = 1  # GPU split mode
     
     # Search configuration
     TOP_K_RESULTS = 5

@@ -12,6 +12,7 @@ import numpy as np
 from PIL import Image
 import base64
 from io import BytesIO
+import torch
 from document_tracker import document_tracker
 from chart_analyzer import chart_analyzer
 
@@ -55,12 +56,26 @@ class DocumentAnalyzer:
         self.uploads_dir.mkdir(exist_ok=True)
         self.processed_dir.mkdir(exist_ok=True)
         
-        # Initialize TrOCR if available
+        # Initialize TrOCR with optimized settings
         if TROCR_AVAILABLE:
             try:
-                self.trocr_processor = TrOCRProcessor.from_pretrained('microsoft/trocr-base-printed')
-                self.trocr_model = VisionEncoderDecoderModel.from_pretrained('microsoft/trocr-base-printed')
-                logger.info("TrOCR initialized successfully")
+                # Use fast processor to avoid slow warning
+                self.trocr_processor = TrOCRProcessor.from_pretrained(
+                    'microsoft/trocr-base-printed',
+                    use_fast=True  # This fixes the "slow image processor" warning
+                )
+                self.trocr_model = VisionEncoderDecoderModel.from_pretrained(
+                    'microsoft/trocr-base-printed',
+                    torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32  # Use half precision on GPU
+                )
+                
+                # Move to GPU if available
+                if torch.cuda.is_available():
+                    self.trocr_model = self.trocr_model.to('cuda').half()
+                    logger.info("TrOCR initialized successfully on GPU with fast processor")
+                else:
+                    logger.info("TrOCR initialized successfully on CPU with fast processor")
+                    
             except Exception as e:
                 logger.warning(f"TrOCR initialization failed: {e}")
                 self.trocr_processor = None

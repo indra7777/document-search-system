@@ -12,7 +12,7 @@ class LLMServiceCPP:
         self._load_model()
     
     def _load_model(self):
-        """Load the GGUF model using llama-cpp-python with GPU acceleration"""
+        """Load the GGUF model using llama-cpp-python with optimized GPU acceleration"""
         try:
             model_path = self.config.LOCAL_LLM_MODEL_PATH
             
@@ -24,19 +24,49 @@ class LLMServiceCPP:
             
             self.logger.info(f"Loading GGUF model: {model_path}")
             
+            # Check GPU memory and optimize accordingly
+            from gpu_optimizer import gpu_optimizer
+            gpu_memory = gpu_optimizer.get_gpu_memory_info()
+            
+            # Optimize parameters based on RTX 4090 capabilities
+            if gpu_memory and gpu_memory['free'] > 10:  # >10GB free
+                n_batch = 1024  # Large batch for fast inference
+                n_threads = 12  # More threads for large model
+                split_mode = 1   # GPU acceleration mode
+            elif gpu_memory and gpu_memory['free'] > 5:  # >5GB free
+                n_batch = 512
+                n_threads = 8
+                split_mode = 1
+            else:
+                n_batch = 256
+                n_threads = 6
+                split_mode = 0  # Fallback to CPU if low memory
+            
+            self.logger.info(f"GPU Memory: {gpu_memory['free']:.1f}GB free, using batch_size={n_batch}")
+            
             # Initialize with GPU acceleration for RTX 4090
             self.llm = Llama(
                 model_path=str(model_path),
                 n_ctx=self.config.N_CTX,
-                n_gpu_layers=self.config.N_GPU_LAYERS,  # Use all GPU layers
-                verbose=False,
-                n_threads=8,  # Optimize for CPU threads
-                n_batch=512,  # Batch size for processing
+                n_gpu_layers=-1,  # Force all layers to GPU
+                verbose=True,  # Enable verbose to see GPU usage
+                n_threads=1,  # Minimal CPU threads when using GPU
+                n_batch=n_batch,  # Optimized batch size
                 use_mmap=True,  # Memory mapping for efficiency
-                use_mlock=True,  # Lock memory pages
+                use_mlock=False,  # Don't lock memory - can cause issues
+                f16_kv=True,  # Use half precision for key-value cache
+                logits_all=False,  # Only compute logits for last token
+                embedding=False,  # We're not using embeddings
             )
             
-            self.logger.info("GGUF model loaded successfully with GPU acceleration")
+            self.logger.info("GGUF model loaded successfully with optimized GPU acceleration")
+            
+            # Warm up the model with a small inference
+            try:
+                warmup_response = self.llm("Test", max_tokens=1, temperature=0.1)
+                self.logger.info("Model warmup completed successfully")
+            except Exception as warmup_error:
+                self.logger.warning(f"Model warmup failed: {warmup_error}")
             
         except Exception as e:
             self.logger.error(f"Failed to load GGUF model: {str(e)}")
@@ -79,16 +109,18 @@ class LLMServiceCPP:
             # Create prompt with context and query
             prompt = self._create_rag_prompt(query, context)
             
-            # Generate response using llama.cpp
+            # Generate response using llama.cpp with GPU-optimized settings
             response = self.llm(
                 prompt,
-                max_tokens=self.config.MAX_TOKENS,
+                max_tokens=min(self.config.MAX_TOKENS, 1024),  # Shorter responses for faster generation
                 temperature=self.config.LLM_TEMPERATURE,
                 top_p=0.9,
                 top_k=40,
                 repeat_penalty=1.1,
-                stop=["</s>", "Human:", "Assistant:", "\n\n\n"],
-                echo=False
+                stop=["</s>", "Human:", "Assistant:", "\n\n\n", "<|", "###"],
+                echo=False,
+                stream=False,  # Could enable streaming later
+                seed=-1,  # Random seed for variety
             )
             
             generated_text = response['choices'][0]['text'].strip()

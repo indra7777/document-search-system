@@ -34,19 +34,37 @@ class ServiceManager:
         self.config = config
     
     def get_service(self, service_name: str, service_class, *args, **kwargs):
-        """Get or create a service instance"""
+        """Get or create a service instance with GPU memory optimization"""
         if service_name not in self.services:
             logger.info(f"Creating new {service_name} service")
             
-            # Perform GPU cleanup before creating memory-intensive services
+            # Check GPU memory before creating memory-intensive services
+            gpu_memory_before = None
             if service_name in ['embedding_service', 'llm_service', 'document_analyzer']:
-                gpu_optimizer.cleanup_gpu_memory()
+                gpu_memory_before = gpu_optimizer.get_gpu_memory_info()
+                
+                # Cleanup if memory is low
+                if gpu_memory_before and gpu_memory_before['free'] < 3.0:  # Less than 3GB free
+                    logger.warning(f"Low GPU memory ({gpu_memory_before['free']:.1f}GB), cleaning up before creating {service_name}")
+                    gpu_optimizer.cleanup_gpu_memory(force=True)
+                
+                # Enable optimizations for GPU services
+                gpu_optimizer.enable_memory_efficient_attention()
+                gpu_optimizer.setup_mixed_precision()
             
             # Create the service
             self.services[service_name] = service_class(*args, **kwargs)
+            
+            # Log memory usage after creation
+            if gpu_memory_before:
+                gpu_memory_after = gpu_optimizer.get_gpu_memory_info()
+                if gpu_memory_after:
+                    memory_used = gpu_memory_after['allocated'] - gpu_memory_before['allocated']
+                    logger.info(f"{service_name} created, using {memory_used:.2f}GB GPU memory")
+            
             logger.info(f"{service_name} service created successfully")
         else:
-            logger.info(f"Using existing {service_name} service")
+            logger.info(f"Using cached {service_name} service")
         
         return self.services[service_name]
     
