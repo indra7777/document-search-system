@@ -1,0 +1,46 @@
+# Enhanced Document Analysis Requirements
+
+# Core dependencies (existing)
+streamlit
+faiss-cpu
+sentence-transformers
+transformers
+torch
+numpy
+pandas
+
+# Document processing
+PyMuPDF  # fitz for PDF processing
+python-docx
+openpyxl
+
+# Table extraction
+camelot-py[cv]  # Advanced table extraction from PDFs
+tabula-py       # Alternative table extraction
+pdfplumber      # Additional PDF processing
+
+# OCR and handwriting recognition
+pytesseract     # OCR engine
+Pillow          # Image processing
+opencv-python   # Computer vision for image preprocessing
+
+# TrOCR for handwriting recognition (optional - large download)
+# transformers[tf]  # Already included above
+
+# Additional image processing
+scikit-image    # Advanced image processing
+pdf2image       # Convert PDF pages to images
+
+# Data handling
+xlrd            # Excel file reading
+xlwt            # Excel file writing
+lxml            # XML processing for various formats
+
+# System dependencies needed (install via apt/brew):
+# - tesseract-ocr
+# - poppler-utils
+# - ghostscript
+# - libgl1-mesa-glx (for opencv on Linux)
+
+# Optional: For better table detection
+# detectron2      # Advanced table detection (requires specific PyTorch version)

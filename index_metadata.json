@@ -1,0 +1,10 @@
+{
+  "build_timestamp": 1753354984.6095064,
+  "data_paths": [
+    "./Dataset/"
+  ],
+  "total_documents": 5,
+  "total_chunks": 29,
+  "embedding_model": "BAAI/bge-large-en-v1.5",
+  "llm_model": "/workspace/models/llama-model.gguf"
+}

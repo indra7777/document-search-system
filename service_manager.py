@@ -1,0 +1,80 @@
+"""
+Singleton Service Manager to prevent multiple model instances
+"""
+import logging
+from typing import Optional, Dict, Any
+import threading
+from gpu_optimizer import gpu_optimizer
+
+logger = logging.getLogger(__name__)
+
+class ServiceManager:
+    """Singleton manager for all services to prevent multiple instances"""
+    
+    _instance = None
+    _lock = threading.Lock()
+    
+    def __new__(cls):
+        if cls._instance is None:
+            with cls._lock:
+                if cls._instance is None:
+                    cls._instance = super(ServiceManager, cls).__new__(cls)
+                    cls._instance._initialized = False
+        return cls._instance
+    
+    def __init__(self):
+        if not self._initialized:
+            self.services = {}
+            self.config = None
+            self._initialized = True
+            logger.info("ServiceManager initialized")
+    
+    def set_config(self, config):
+        """Set the configuration for all services"""
+        self.config = config
+    
+    def get_service(self, service_name: str, service_class, *args, **kwargs):
+        """Get or create a service instance"""
+        if service_name not in self.services:
+            logger.info(f"Creating new {service_name} service")
+            
+            # Perform GPU cleanup before creating memory-intensive services
+            if service_name in ['embedding_service', 'llm_service', 'document_analyzer']:
+                gpu_optimizer.cleanup_gpu_memory()
+            
+            # Create the service
+            self.services[service_name] = service_class(*args, **kwargs)
+            logger.info(f"{service_name} service created successfully")
+        else:
+            logger.info(f"Using existing {service_name} service")
+        
+        return self.services[service_name]
+    
+    def clear_service(self, service_name: str):
+        """Clear a specific service"""
+        if service_name in self.services:
+            del self.services[service_name]
+            gpu_optimizer.cleanup_gpu_memory(force=True)
+            logger.info(f"{service_name} service cleared")
+    
+    def clear_all_services(self):
+        """Clear all services"""
+        self.services.clear()
+        gpu_optimizer.cleanup_gpu_memory(force=True)
+        logger.info("All services cleared")
+    
+    def get_memory_stats(self) -> Dict[str, Any]:
+        """Get memory statistics"""
+        stats = {
+            "active_services": list(self.services.keys()),
+            "service_count": len(self.services)
+        }
+        
+        gpu_stats = gpu_optimizer.get_gpu_memory_info()
+        if gpu_stats:
+            stats.update(gpu_stats)
+        
+        return stats
+
+# Global service manager instance
+service_manager = ServiceManager()
